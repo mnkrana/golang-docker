@@ -1,61 +1,106 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
-	"net"
 	"net/http"
+	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 )
 
+const (
+	htmlIndex = `<html><body>Welcome!</body></html>`
+	httpPort  = ":80"
+)
+
+var (
+	flgProduction          = true
+	flgRedirectHTTPToHTTPS = true
+)
+
+func handleIndex(w http.ResponseWriter, r *http.Request) {
+	io.WriteString(w, htmlIndex)
+}
+
+func makeServerFromMux(mux *http.ServeMux) *http.Server {
+	// set timeouts so that a slow or malicious client doesn't
+	// hold resources forever
+	return &http.Server{
+		ReadTimeout:  20 * time.Second,
+		WriteTimeout: 50 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		Handler:      mux,
+	}
+}
+
+func makeHTTPServer() *http.Server {
+	mux := &http.ServeMux{}
+	mux.HandleFunc("/", handleIndex)
+	return makeServerFromMux(mux)
+
+}
+
+func makeHTTPToHTTPSRedirectServer() *http.Server {
+	handleRedirect := func(w http.ResponseWriter, r *http.Request) {
+		newURI := "https://" + r.Host + r.URL.String()
+		http.Redirect(w, r, newURI, http.StatusFound)
+	}
+	mux := &http.ServeMux{}
+	mux.HandleFunc("/", handleRedirect)
+	return makeServerFromMux(mux)
+}
+
 func main() {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", index)
+	var m *autocert.Manager
 
-	server := http.Server{
-		Addr:    ":443",
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			NextProtos: []string{"h2", "http/1.1"},
-		},
+	var httpsSrv *http.Server
+	if flgProduction {
+		hostPolicy := func(ctx context.Context, host string) error {
+			if host == "mithyagames.com" || host == "www.mithyagames.com" {
+				return nil
+			}
+			return fmt.Errorf("acme/autocert: only mithyagames.com host is allowed")
+		}
+
+		dataDir := "."
+		m = &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: hostPolicy,
+			Cache:      autocert.DirCache(dataDir),
+		}
+
+		httpsSrv = makeHTTPServer()
+		httpsSrv.Addr = ":443"
+		httpsSrv.TLSConfig = &tls.Config{GetCertificate: m.GetCertificate}
+
+		go func() {
+			fmt.Printf("Starting HTTPS server on %s\n", httpsSrv.Addr)
+			err := httpsSrv.ListenAndServeTLS("", "")
+			if err != nil {
+				log.Fatalf("httpsSrv.ListendAndServeTLS() failed with %s", err)
+			}
+		}()
 	}
 
-	fmt.Printf("Server listening on %s", server.Addr)
+	var httpSrv *http.Server
+	if flgRedirectHTTPToHTTPS {
+		httpSrv = makeHTTPToHTTPSRedirectServer()
+	} else {
+		httpSrv = makeHTTPServer()
+	}
+	// allow autocert handle Let's Encrypt callbacks over http
+	if m != nil {
+		httpSrv.Handler = m.HTTPHandler(httpSrv.Handler)
+	}
 
-	go http.ListenAndServe(":80", http.HandlerFunc(redirectHTTP))
-
-	crt := "/etc/letsencrypt/live/mithyagames.com/fullchain.pem"
-	key := "/etc/letsencrypt/live/mithyagames.com/privkey.pem"
-
-	err := server.ListenAndServeTLS(crt, key)
-
+	httpSrv.Addr = httpPort
+	fmt.Printf("Starting HTTP server on %s\n", httpPort)
+	err := httpSrv.ListenAndServe()
 	if err != nil {
-		fmt.Println(err)
+		log.Fatalf("httpSrv.ListenAndServe() failed with %s", err)
 	}
-}
-
-func index(w http.ResponseWriter, r *http.Request) {
-	log.Println("request " + r.URL.Path)
-	fmt.Fprintln(w, "Hello Mayank!")
-}
-
-func redirectHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Println("Method : " + r.Method + " Port : " + r.Host +
-		" URI : " + r.URL.RequestURI())
-
-	if r.Method != "GET" && r.Method != "HEAD" {
-		http.Error(w, "Use HTTPS", http.StatusBadRequest)
-		return
-	}
-
-	target := "https://" + stripPort(r.Host) + r.URL.RequestURI()
-	http.Redirect(w, r, target, http.StatusFound)
-}
-
-func stripPort(hostport string) string {
-	host, _, err := net.SplitHostPort(hostport)
-	if err != nil {
-		return hostport
-	}
-	return net.JoinHostPort(host, "443")
 }
